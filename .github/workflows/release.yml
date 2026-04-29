@@ -82,10 +82,16 @@ jobs:
             exit 1
           fi
 
+          prerelease_args=""
+          case "$TAG_NAME" in
+            *-*) prerelease_args="--prerelease" ;;
+          esac
+
           gh release create "$TAG_NAME" \
             "$apple_artifact" \
             "$windows_artifact" \
             SHA256SUMS \
             --repo "$GH_REPO" \
+            $prerelease_args \
             --title "$TAG_NAME" \
             --notes "Aegis native release artifacts for Apple Silicon and Windows MSVC."
