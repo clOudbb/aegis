@@ -58,15 +58,32 @@ jobs:
           path: release-artifacts
       - name: Merge checksums
         run: |
-          cat release-artifacts/*/SHA256SUMS | sort > SHA256SUMS
+          find release-artifacts -name SHA256SUMS -type f -print0 \
+            | sort -z \
+            | xargs -0 cat \
+            | sort > SHA256SUMS
       - name: Publish artifacts
         env:
           GH_TOKEN: ${{ github.token }}
           TAG_NAME: ${{ github.ref_name }}
         run: |
+          apple_artifact="$(find release-artifacts -name AegisFFI.xcframework.zip -type f -print -quit)"
+          windows_artifact="$(find release-artifacts -name aegis-windows-x86_64-msvc.zip -type f -print -quit)"
+
+          if [ -z "$apple_artifact" ]; then
+            echo "Missing AegisFFI.xcframework.zip" >&2
+            find release-artifacts -type f >&2
+            exit 1
+          fi
+          if [ -z "$windows_artifact" ]; then
+            echo "Missing aegis-windows-x86_64-msvc.zip" >&2
+            find release-artifacts -type f >&2
+            exit 1
+          fi
+
           gh release create "$TAG_NAME" \
-            release-artifacts/apple-release-artifacts/AegisFFI.xcframework.zip \
-            release-artifacts/windows-release-artifacts/aegis-windows-x86_64-msvc.zip \
+            "$apple_artifact" \
+            "$windows_artifact" \
             SHA256SUMS \
             --title "$TAG_NAME" \
             --notes "Aegis native release artifacts for Apple Silicon and Windows MSVC."
