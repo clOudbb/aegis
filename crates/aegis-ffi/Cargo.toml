@@ -1,0 +1,17 @@
+[package]
+name = "aegis-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "C ABI facade for the Aegis console core."
+
+[lib]
+name = "aegis_ffi"
+path = "src/lib.rs"
+crate-type = ["rlib", "staticlib", "cdylib"]
+
+[dependencies]
+aegis-core = { path = "../aegis-core" }
+
+[lints]
+workspace = true

@@ -1,0 +1,4 @@
+module AegisFFI {
+  header "aegis.h"
+  export *
+}

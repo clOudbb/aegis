@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  rust:
+    name: Rust validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets --all-features --locked -- -D warnings
+      - run: cargo test --all-features
+      - run: cargo doc --no-deps --all-features
+
+  apple-package:
+    name: Apple package preview
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,aarch64-apple-ios,aarch64-apple-ios-sim
+      - run: ./scripts/check-c-header.sh
+      - run: ./scripts/package-apple-xcframework.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AegisFFI.xcframework.zip
+          path: dist/apple/AegisFFI.xcframework.zip
+
+  windows-package:
+    name: Windows package preview
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - shell: pwsh
+        run: ./scripts/package-windows-msvc.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aegis-windows-x86_64-msvc.zip
+          path: dist/windows/aegis-windows-x86_64-msvc.zip
