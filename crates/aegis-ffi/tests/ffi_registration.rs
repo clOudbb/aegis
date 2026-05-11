@@ -1,6 +1,9 @@
 //! Contract tests for C ABI plugin, command, and cvar registration.
 
-use aegis_ffi::error::{AEGIS_ERROR_INTERNAL, AEGIS_ERROR_INVALID_ARGUMENT, AEGIS_OK};
+use aegis_ffi::error::{
+    AEGIS_ERROR_INTERNAL, AEGIS_ERROR_INVALID_ARGUMENT, AEGIS_ERROR_PARSE, AEGIS_ERROR_REGISTRY,
+    AEGIS_OK,
+};
 use aegis_ffi::result::{AEGIS_EXECUTION_STATUS_FAILED, AEGIS_EXECUTION_STATUS_SUCCESS};
 use aegis_ffi::string::AegisStringView;
 use aegis_ffi::{
@@ -216,6 +219,81 @@ fn ffi_register_plugin_returns_plugin_handle() {
 }
 
 #[test]
+fn ffi_plugin_release_tolerates_null_handle() {
+    release_plugin(core::ptr::null_mut());
+}
+
+#[test]
+fn ffi_register_plugin_rejects_null_core_handle() {
+    let mut plugin = core::ptr::null_mut();
+    let code = register_plugin(
+        core::ptr::null_mut(),
+        "host.debug",
+        "Host Debug",
+        &mut plugin,
+    );
+
+    assert_eq!(code, AEGIS_ERROR_INVALID_ARGUMENT);
+    assert!(plugin.is_null());
+}
+
+#[test]
+fn ffi_register_plugin_rejects_null_out_plugin() {
+    let core = aegis_core_create();
+    let code = register_plugin(core, "host.debug", "Host Debug", core::ptr::null_mut());
+
+    assert_eq!(code, AEGIS_ERROR_INVALID_ARGUMENT);
+
+    release_core(core);
+}
+
+#[test]
+fn ffi_register_plugin_rejects_invalid_utf8_id() {
+    let core = aegis_core_create();
+    let invalid = [0xff_u8];
+    let id = AegisStringView {
+        ptr: invalid.as_ptr(),
+        len: invalid.len(),
+    };
+    let mut plugin = core::ptr::null_mut();
+    // SAFETY: Test passes a live core handle and intentionally invalid UTF-8
+    // string view to exercise argument validation.
+    let code = unsafe {
+        aegis_register_plugin(
+            core,
+            id,
+            AegisStringView::from_str("Host Debug"),
+            AegisStringView::from_str("0.1.0"),
+            &mut plugin,
+        )
+    };
+
+    assert_eq!(code, AEGIS_ERROR_INVALID_ARGUMENT);
+    assert!(plugin.is_null());
+
+    release_core(core);
+}
+
+#[test]
+fn ffi_register_plugin_rejects_duplicate_plugin_id() {
+    let core = aegis_core_create();
+    let mut first = core::ptr::null_mut();
+    let mut second = core::ptr::null_mut();
+    assert_eq!(
+        register_plugin(core, "host.debug", "Host Debug", &mut first),
+        AEGIS_OK
+    );
+
+    let code = register_plugin(core, "HOST.DEBUG", "Host Debug Again", &mut second);
+
+    assert_eq!(code, AEGIS_ERROR_REGISTRY);
+    assert!(second.is_null());
+
+    release_plugin(first);
+    release_core(core);
+}
+
+#[test]
 fn ffi_plugin_handle_after_core_release_returns_invalid_argument() {
     let core = aegis_core_create();
     let mut plugin = core::ptr::null_mut();
@@ -230,6 +308,35 @@ fn ffi_plugin_handle_after_core_release_returns_invalid_argument() {
     assert_eq!(code, AEGIS_ERROR_INVALID_ARGUMENT);
 
     release_plugin(plugin);
+}
+
+#[test]
+fn ffi_register_cvar_rejects_null_plugin() {
+    let code = register_cvar(
+        core::ptr::null_mut(),
+        "developer",
+        "0",
+        "Enable developer output",
+    );
+
+    assert_eq!(code, AEGIS_ERROR_INVALID_ARGUMENT);
+}
+
+#[test]
+fn ffi_register_cvar_rejects_invalid_name() {
+    let core = aegis_core_create();
+    let mut plugin = core::ptr::null_mut();
+    assert_eq!(
+        register_plugin(core, "host.settings", "Host Settings", &mut plugin),
+        AEGIS_OK
+    );
+
+    let code = register_cvar(plugin, "/developer", "0", "Enable developer output");
+
+    assert_eq!(code, AEGIS_ERROR_PARSE);
+
+    release_plugin(plugin);
+    release_core(core);
 }
 
 #[test]
@@ -276,6 +383,50 @@ fn ffi_register_command_under_plugin_allows_execute_line() {
     release_result(result);
     release_plugin(plugin);
     release_core(core);
+}
+
+#[test]
+fn ffi_register_command_rejects_null_plugin() {
+    let code = register_command(core::ptr::null_mut(), hello_command as AegisCommandCallback);
+
+    assert_eq!(code, AEGIS_ERROR_INVALID_ARGUMENT);
+}
+
+#[test]
+fn ffi_register_command_rejects_null_callback() {
+    let core = aegis_core_create();
+    let mut plugin = core::ptr::null_mut();
+    assert_eq!(
+        register_plugin(core, "host.commands", "Host Commands", &mut plugin),
+        AEGIS_OK
+    );
+    // SAFETY: Test passes a live plugin handle and intentionally null callback
+    // to exercise callback validation.
+    let code = unsafe {
+        aegis_register_command(
+            plugin,
+            AegisStringView::from_str("host_hello"),
+            0,
+            AegisStringView::from_str("Host hello command"),
+            None,
+            core::ptr::null_mut(),
+        )
+    };
+
+    assert_eq!(code, AEGIS_ERROR_INVALID_ARGUMENT);
+
+    release_plugin(plugin);
+    release_core(core);
+}
+
+#[test]
+fn ffi_context_write_text_rejects_null_context() {
+    // SAFETY: Test deliberately passes a null context to exercise validation.
+    let code = unsafe {
+        aegis_context_write_text(core::ptr::null_mut(), AegisStringView::from_str("hello"))
+    };
+
+    assert_eq!(code, AEGIS_ERROR_INVALID_ARGUMENT);
 }
 
 #[test]
