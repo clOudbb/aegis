@@ -35,6 +35,9 @@ impl AegisStringView {
         if self.ptr.is_null() {
             return (self.len == 0).then_some("");
         }
+        if self.len > isize::MAX as usize {
+            return None;
+        }
 
         // SAFETY: The ABI contract requires callers to pass a pointer valid for
         // `len` bytes for the duration of the call. Invalid UTF-8 is rejected

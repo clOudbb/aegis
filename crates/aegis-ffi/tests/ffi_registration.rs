@@ -1,5 +1,7 @@
 //! Contract tests for C ABI plugin, command, and cvar registration.
 
+use std::thread;
+
 use aegis_ffi::error::{
     AEGIS_ERROR_INTERNAL, AEGIS_ERROR_INVALID_ARGUMENT, AEGIS_ERROR_PARSE, AEGIS_ERROR_REGISTRY,
     AEGIS_OK,
@@ -358,6 +360,38 @@ fn ffi_register_cvar_under_plugin_allows_read_by_name() {
     assert_eq!(result_status_code(result), AEGIS_EXECUTION_STATUS_SUCCESS);
 
     release_result(result);
+    release_plugin(plugin);
+    release_core(core);
+}
+
+#[test]
+fn ffi_register_cvar_allows_concurrent_reads_of_same_plugin_handle() {
+    let core = aegis_core_create();
+    let mut plugin = core::ptr::null_mut();
+    assert_eq!(
+        register_plugin(core, "host.settings", "Host Settings", &mut plugin),
+        AEGIS_OK
+    );
+
+    let plugin_addr = plugin as usize;
+    let handles: Vec<_> = (0..4)
+        .map(|index| {
+            thread::spawn(move || {
+                let plugin = plugin_addr as *mut aegis_ffi::register::AegisPluginHandle;
+                let name = format!("worker_{index}");
+                register_cvar(plugin, &name, "0", "Worker value")
+            })
+        })
+        .collect();
+
+    for handle in handles {
+        let code = match handle.join() {
+            Ok(code) => code,
+            Err(_) => AEGIS_ERROR_INTERNAL,
+        };
+        assert_eq!(code, AEGIS_OK);
+    }
+
     release_plugin(plugin);
     release_core(core);
 }

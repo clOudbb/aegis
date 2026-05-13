@@ -265,6 +265,23 @@ fn ffi_execute_line_rejects_invalid_utf8_input() {
 }
 
 #[test]
+fn ffi_execute_line_rejects_impossibly_large_string_view() {
+    let core = aegis_core_create();
+    let input = AegisStringView {
+        ptr: core::ptr::NonNull::<u8>::dangling().as_ptr(),
+        len: usize::MAX,
+    };
+    let mut result =
+        core::ptr::NonNull::<aegis_ffi::result::AegisExecutionResultHandle>::dangling().as_ptr();
+    let code = execute_line(core, input, &mut result);
+
+    assert_eq!(code, AEGIS_ERROR_INVALID_ARGUMENT);
+    assert!(result.is_null());
+
+    release_core(core);
+}
+
+#[test]
 fn ffi_execute_script_returns_result_handle_for_echo_script() {
     let core = aegis_core_create();
     let source = AegisStringView::from_str("test.cfg");
@@ -308,6 +325,28 @@ fn ffi_execute_script_rejects_non_null_options_pointer() {
     let source = AegisStringView::from_str("test.cfg");
     let script = AegisStringView::from_str("echo one");
     let mut result = core::ptr::null_mut();
+    let options = 1_u8;
+    let code = execute_script_with_options(
+        core,
+        source,
+        script,
+        &options as *const u8 as *const core::ffi::c_void,
+        &mut result,
+    );
+
+    assert_eq!(code, AEGIS_ERROR_INVALID_ARGUMENT);
+    assert!(result.is_null());
+
+    release_core(core);
+}
+
+#[test]
+fn ffi_execute_script_clears_out_result_when_options_pointer_is_rejected() {
+    let core = aegis_core_create();
+    let source = AegisStringView::from_str("test.cfg");
+    let script = AegisStringView::from_str("echo one");
+    let mut result =
+        core::ptr::NonNull::<aegis_ffi::result::AegisExecutionResultHandle>::dangling().as_ptr();
     let options = 1_u8;
     let code = execute_script_with_options(
         core,

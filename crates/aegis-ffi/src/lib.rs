@@ -2,14 +2,15 @@
 //!
 //! This crate owns all C-compatible exported symbols and ABI-facing types.
 //! The safe Rust implementation lives in `aegis-core`.
-//! Phase 0 exports only ABI version metadata and uses no unsafe blocks.
-//! Future raw-pointer code must document each unsafe block with `SAFETY:`
-//! invariants and boundary tests.
+//! Raw-pointer code documents each unsafe block with `SAFETY:` invariants and
+//! is covered by boundary tests.
 //!
 //! # FFI behavior
 //!
 //! ABI structs use `#[repr(C)]`, include a `size` field, and avoid Rust-owned
-//! containers such as `String`, `Vec`, `Result`, and `Option`.
+//! containers such as `String`, `Vec`, and `Result`. Nullable C function
+//! pointers are represented in Rust with the ABI-compatible `Option<fn>` form
+//! and exposed through the C header as plain function pointers.
 
 #![deny(missing_docs)]
 
@@ -321,7 +322,7 @@ fn execute_script_impl(
     options_ptr: *const core::ffi::c_void,
     out_result: *mut *mut AegisExecutionResultHandle,
 ) -> u32 {
-    if out_result.is_null() || !options_ptr.is_null() {
+    if out_result.is_null() {
         return AEGIS_ERROR_INVALID_ARGUMENT;
     }
 
@@ -329,6 +330,10 @@ fn execute_script_impl(
     // storage for one result handle pointer for the duration of this call.
     unsafe {
         *out_result = core::ptr::null_mut();
+    }
+
+    if !options_ptr.is_null() {
+        return AEGIS_ERROR_INVALID_ARGUMENT;
     }
 
     if core.is_null() {

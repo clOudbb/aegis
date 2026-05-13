@@ -338,7 +338,7 @@ fn with_plugin_core(
 
     // SAFETY: `plugin` is checked for null above and must be a live plugin
     // handle returned by `aegis_register_plugin`.
-    let plugin = unsafe { &mut *plugin };
+    let plugin = unsafe { &*plugin };
     let Some(core) = plugin.core.upgrade() else {
         return AEGIS_ERROR_INVALID_ARGUMENT;
     };

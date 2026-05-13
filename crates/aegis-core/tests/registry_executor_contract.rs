@@ -153,6 +153,19 @@ fn executor_returns_error_for_unknown_command() -> Result<()> {
 }
 
 #[test]
+fn executor_help_missing_topic_returns_failed_status_and_error() -> Result<()> {
+    let executor = Executor::with_builtins();
+    let result = executor.execute_line("help missing_command")?;
+
+    assert_eq!(result.status(), ExecutionStatus::Failed);
+    assert_eq!(
+        result.error().map(AegisError::code),
+        Some(aegis_core::error::AegisErrorCode::CommandNotFound)
+    );
+    Ok(())
+}
+
+#[test]
 fn executor_reads_cvar_by_name() -> Result<()> {
     let mut executor = Executor::with_builtins();
     executor.register_cvar(
@@ -197,6 +210,35 @@ fn executor_rejects_unquoted_cvar_value_with_spaces() -> Result<()> {
     let result = executor.execute_line("player_name hello world")?;
 
     assert_eq!(result.status(), ExecutionStatus::Failed);
+    Ok(())
+}
+
+#[test]
+fn executor_cvar_failure_preserves_specific_error() -> Result<()> {
+    let mut executor = Executor::with_builtins();
+    executor.register_cvar("build_number", "1", ConsoleFlags::READ_ONLY, "Build number")?;
+
+    let result = executor.execute_line("build_number 2")?;
+
+    assert_eq!(result.status(), ExecutionStatus::Failed);
+    assert_eq!(
+        result.error().map(AegisError::message),
+        Some("cvar is read-only")
+    );
+    Ok(())
+}
+
+#[test]
+fn executor_builtin_get_failure_preserves_specific_error() -> Result<()> {
+    let executor = Executor::with_builtins();
+
+    let result = executor.execute_line("get missing_cvar")?;
+
+    assert_eq!(result.status(), ExecutionStatus::Failed);
+    assert_eq!(
+        result.error().map(AegisError::message),
+        Some("cvar is not registered")
+    );
     Ok(())
 }
 
@@ -437,6 +479,48 @@ fn plugin_registration_rolls_back_capabilities_on_error() -> Result<()> {
             .cvars()
             .iter()
             .any(|cvar| cvar.name().canonical() == "partial_value")
+    );
+    Ok(())
+}
+
+#[test]
+#[allow(clippy::panic)]
+fn plugin_registration_panic_returns_error_and_rolls_back_capabilities() -> Result<()> {
+    let mut executor = Executor::with_builtins();
+    let registration = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        executor.register_plugin(
+            PluginDescriptor::new("host.panicking", "Host Panicking"),
+            |plugin| {
+                plugin.register_cvar(
+                    "panic_value",
+                    "0",
+                    ConsoleFlags::empty(),
+                    "Partially registered value",
+                )?;
+                panic!("plugin setup panic");
+            },
+        )
+    }));
+    let registration = match registration {
+        Ok(registration) => registration,
+        Err(_) => {
+            return Err(AegisError::internal(
+                "plugin registration panic should not cross public API",
+            ));
+        }
+    };
+    let error = expect_error(
+        registration,
+        "plugin registration panic should be converted to an error",
+    )?;
+
+    assert_eq!(error.message(), "plugin registration panicked");
+    assert!(!executor.contains_plugin("host.panicking"));
+    assert!(
+        !executor
+            .cvars()
+            .iter()
+            .any(|cvar| cvar.name().canonical() == "panic_value")
     );
     Ok(())
 }

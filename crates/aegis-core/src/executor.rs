@@ -19,6 +19,11 @@ use crate::query::{CompletionItem, CompletionKind, HelpTopic, HelpTopicKind};
 use crate::registry::{CommandMetadata, CommandRegistry};
 use crate::sink::OutputSink;
 
+struct CVarExecution {
+    status: ExecutionStatus,
+    error: Option<AegisError>,
+}
+
 /// Status returned by a command handler.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CommandStatus {
@@ -100,6 +105,16 @@ type CommandHandler =
 #[derive(Clone)]
 struct CommandEntry {
     handler: CommandHandler,
+}
+
+struct RegistrationSnapshot {
+    registry: CommandRegistry,
+    handlers: BTreeMap<String, CommandEntry>,
+    plugins: PluginRegistry,
+    plugin_output_sink_keys: BTreeSet<(String, String)>,
+    hook_dispatcher: HookDispatcher,
+    direct_output_sinks: Vec<OutputSink>,
+    plugin_output_sinks: Vec<OutputSink>,
 }
 
 /// Synchronous console command executor.
@@ -220,34 +235,55 @@ impl Executor {
     }
 
     /// Register a plugin and install capabilities through a restricted registrar.
+    ///
+    /// Registration is transactional: if the registration closure returns an
+    /// error or panics, the plugin descriptor and all capabilities registered
+    /// by that closure are rolled back before this method returns. Panics from
+    /// the registration closure are converted to an internal error and do not
+    /// cross this public API boundary.
     pub fn register_plugin<F>(&mut self, descriptor: PluginDescriptor, register: F) -> Result<()>
     where
         F: FnOnce(&mut PluginRegistrar<'_>) -> Result<()>,
     {
         let plugin_id = PluginId::parse(descriptor.id().original())?;
-        let registry_snapshot = self.registry.borrow().clone();
-        let handlers_snapshot = self.handlers.borrow().clone();
-        let plugins_snapshot = self.plugins.clone();
-        let plugin_output_sink_keys_snapshot = self.plugin_output_sink_keys.clone();
-        let hook_dispatcher_snapshot = self.hook_dispatcher.clone();
-        let direct_output_sinks_snapshot = self.direct_output_sinks.clone();
-        let plugin_output_sinks_snapshot = self.plugin_output_sinks.clone();
+        let snapshot = self.registration_snapshot();
 
         self.plugins.register(descriptor)?;
 
         let mut registrar = PluginRegistrar::new(plugin_id, self);
-        if let Err(error) = register(&mut registrar) {
-            *self.registry.borrow_mut() = registry_snapshot;
-            *self.handlers.borrow_mut() = handlers_snapshot;
-            self.plugins = plugins_snapshot;
-            self.plugin_output_sink_keys = plugin_output_sink_keys_snapshot;
-            self.hook_dispatcher = hook_dispatcher_snapshot;
-            self.direct_output_sinks = direct_output_sinks_snapshot;
-            self.plugin_output_sinks = plugin_output_sinks_snapshot;
-            return Err(error);
+        match catch_unwind(AssertUnwindSafe(|| register(&mut registrar))) {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => {
+                self.restore_registration_snapshot(snapshot);
+                Err(error)
+            }
+            Err(_) => {
+                self.restore_registration_snapshot(snapshot);
+                Err(AegisError::internal("plugin registration panicked"))
+            }
         }
+    }
 
-        Ok(())
+    fn registration_snapshot(&self) -> RegistrationSnapshot {
+        RegistrationSnapshot {
+            registry: self.registry.borrow().clone(),
+            handlers: self.handlers.borrow().clone(),
+            plugins: self.plugins.clone(),
+            plugin_output_sink_keys: self.plugin_output_sink_keys.clone(),
+            hook_dispatcher: self.hook_dispatcher.clone(),
+            direct_output_sinks: self.direct_output_sinks.clone(),
+            plugin_output_sinks: self.plugin_output_sinks.clone(),
+        }
+    }
+
+    fn restore_registration_snapshot(&mut self, snapshot: RegistrationSnapshot) {
+        *self.registry.borrow_mut() = snapshot.registry;
+        *self.handlers.borrow_mut() = snapshot.handlers;
+        self.plugins = snapshot.plugins;
+        self.plugin_output_sink_keys = snapshot.plugin_output_sink_keys;
+        self.hook_dispatcher = snapshot.hook_dispatcher;
+        self.direct_output_sinks = snapshot.direct_output_sinks;
+        self.plugin_output_sinks = snapshot.plugin_output_sinks;
     }
 
     pub(crate) fn register_output_sink_with_owner<F>(
@@ -389,8 +425,12 @@ impl Executor {
         }
 
         if self.registry.borrow().contains_cvar(name) {
-            let status = self.execute_cvar(invocation, &mut context);
-            return ExecutionResult::new(status, context.into_frames());
+            let execution = self.execute_cvar(invocation, &mut context);
+            let mut result = ExecutionResult::new(execution.status, context.into_frames());
+            if let Some(error) = execution.error {
+                result = result.with_error(error);
+            }
+            return result;
         }
 
         let message = format!("command not found: {}", invocation.command().original());
@@ -515,12 +555,30 @@ impl Executor {
                 self.builtin_cvars(&mut context);
                 CommandStatus::Success
             }
-            "help" => {
-                self.builtin_help(&mut context, invocation.args());
-                CommandStatus::Success
-            }
-            "get" => self.builtin_get(&mut context, invocation.args()),
-            "set" => self.builtin_set(&mut context, invocation.args()),
+            "help" => match self.builtin_help(&mut context, invocation.args()) {
+                Ok(()) => CommandStatus::Success,
+                Err(error) => {
+                    context.write_error(error.message());
+                    execution_error = Some(error);
+                    CommandStatus::Failed
+                }
+            },
+            "get" => match self.builtin_get(&mut context, invocation.args()) {
+                Ok(status) => status,
+                Err(error) => {
+                    context.write_error(error.message());
+                    execution_error = Some(error);
+                    CommandStatus::Failed
+                }
+            },
+            "set" => match self.builtin_set(&mut context, invocation.args()) {
+                Ok(status) => status,
+                Err(error) => {
+                    context.write_error(error.message());
+                    execution_error = Some(error);
+                    CommandStatus::Failed
+                }
+            },
             command_name => {
                 let handler = self
                     .handlers
@@ -603,157 +661,169 @@ impl Executor {
         &self,
         invocation: &CommandInvocation,
         context: &mut ExecutionContext,
-    ) -> ExecutionStatus {
-        match invocation.args() {
+    ) -> CVarExecution {
+        let result = match invocation.args() {
             [] => self.read_cvar(context, invocation.command().canonical()),
             [value] => self.write_cvar(context, invocation.command().canonical(), value.as_str()),
-            _ => {
-                context.write_error("cvar write accepts exactly one value");
-                ExecutionStatus::Failed
+            _ => Err(AegisError::invalid_argument(
+                "cvar write accepts exactly one value",
+            )),
+        };
+
+        match result {
+            Ok(()) => CVarExecution {
+                status: ExecutionStatus::Success,
+                error: None,
+            },
+            Err(error) => {
+                context.write_error(error.message());
+                CVarExecution {
+                    status: ExecutionStatus::Failed,
+                    error: Some(error),
+                }
             }
         }
     }
 
-    fn read_cvar(&self, context: &mut ExecutionContext, name: &str) -> ExecutionStatus {
-        let registry = self.registry.borrow();
-        let cvar = match registry.get_cvar(name) {
-            Ok(cvar) => cvar,
-            Err(error) => {
-                context.write_error(error.message());
-                return ExecutionStatus::Failed;
-            }
+    fn read_cvar(&self, context: &mut ExecutionContext, name: &str) -> Result<()> {
+        let output = {
+            let registry = self.registry.borrow();
+            let cvar = registry.get_cvar(name)?;
+            let value = display_cvar_value(cvar);
+            format!("{} = {}", cvar.name().canonical(), value)
         };
-        let value = display_cvar_value(cvar);
-        context.write_text(format!("{} = {}", cvar.name().canonical(), value));
-        ExecutionStatus::Success
+        context.write_text(output);
+        Ok(())
     }
 
-    fn write_cvar(
-        &self,
-        context: &mut ExecutionContext,
-        name: &str,
-        value: &str,
-    ) -> ExecutionStatus {
-        let mut registry = self.registry.borrow_mut();
-        let cvar = match registry.get_cvar_mut(name) {
-            Ok(cvar) => cvar,
-            Err(error) => {
-                context.write_error(error.message());
-                return ExecutionStatus::Failed;
+    fn write_cvar(&self, context: &mut ExecutionContext, name: &str, value: &str) -> Result<()> {
+        let (output, state_changed) = {
+            let mut registry = self.registry.borrow_mut();
+            let cvar = registry.get_cvar_mut(name)?;
+
+            if cvar.flags().contains(ConsoleFlags::CHEAT) && !self.authority.cheats_enabled() {
+                return Err(AegisError::permission_denied(
+                    "cheat-protected cvar cannot change while cheats are disabled",
+                ));
             }
+            if cvar.flags().contains(ConsoleFlags::READ_ONLY) {
+                return Err(AegisError::permission_denied("cvar is read-only"));
+            }
+            if cvar.flags().contains(ConsoleFlags::PRINTABLE_ONLY)
+                && value.chars().any(char::is_control)
+            {
+                return Err(AegisError::invalid_argument(
+                    "cvar value must contain printable characters only",
+                ));
+            }
+
+            cvar.set_value(value);
+            let name = cvar.name().canonical().to_owned();
+            let output = format!("{} = {}", name, display_cvar_value(cvar));
+            let state_changed = cvar
+                .flags()
+                .contains(ConsoleFlags::NOTIFY)
+                .then(|| format!("{name} changed"));
+            (output, state_changed)
         };
 
-        if cvar.flags().contains(ConsoleFlags::CHEAT) && !self.authority.cheats_enabled() {
-            context.write_error("cheat-protected cvar cannot change while cheats are disabled");
-            return ExecutionStatus::Failed;
+        context.write_text(output);
+        if let Some(state_changed) = state_changed {
+            context.write_frame(OutputFrame::state_changed(state_changed));
         }
-        if cvar.flags().contains(ConsoleFlags::READ_ONLY) {
-            context.write_error("cvar is read-only");
-            return ExecutionStatus::Failed;
-        }
-        if cvar.flags().contains(ConsoleFlags::PRINTABLE_ONLY)
-            && value.chars().any(char::is_control)
-        {
-            context.write_error("cvar value must contain printable characters only");
-            return ExecutionStatus::Failed;
-        }
-
-        cvar.set_value(value);
-        context.write_text(format!(
-            "{} = {}",
-            cvar.name().canonical(),
-            display_cvar_value(cvar)
-        ));
-        if cvar.flags().contains(ConsoleFlags::NOTIFY) {
-            context.write_frame(OutputFrame::state_changed(format!(
-                "{} changed",
-                cvar.name().canonical()
-            )));
-        }
-        ExecutionStatus::Success
+        Ok(())
     }
 
     fn builtin_commands(&self, context: &mut ExecutionContext) {
-        for command in self
+        let lines: Vec<String> = self
             .registry
             .borrow()
             .commands()
             .filter(|command| !command.flags().contains(ConsoleFlags::HIDDEN))
-        {
-            context.write_text(format!(
-                "{} - {}",
-                command.name().canonical(),
-                command.description()
-            ));
+            .map(|command| format!("{} - {}", command.name().canonical(), command.description()))
+            .collect();
+        for line in lines {
+            context.write_text(line);
         }
     }
 
     fn builtin_cvars(&self, context: &mut ExecutionContext) {
-        for cvar in self
+        let lines: Vec<String> = self
             .registry
             .borrow()
             .cvars()
             .filter(|cvar| !cvar.flags().contains(ConsoleFlags::HIDDEN))
-        {
-            context.write_text(format!(
-                "{} - {}",
-                cvar.name().canonical(),
-                cvar.description()
-            ));
+            .map(|cvar| format!("{} - {}", cvar.name().canonical(), cvar.description()))
+            .collect();
+        for line in lines {
+            context.write_text(line);
         }
     }
 
-    fn builtin_help(&self, context: &mut ExecutionContext, args: &[CommandArg]) {
+    fn builtin_help(&self, context: &mut ExecutionContext, args: &[CommandArg]) -> Result<()> {
         let Some(name) = args.first() else {
             context.write_text("usage: help <command-or-cvar>");
-            return;
+            return Ok(());
         };
 
-        if let Ok(command) = self.registry.borrow().get_command(name.as_str()) {
-            if !command.flags().contains(ConsoleFlags::HIDDEN) {
-                context.write_text(format!(
-                    "{} - {}",
-                    command.name().canonical(),
-                    command.description()
-                ));
+        let output = {
+            let registry = self.registry.borrow();
+            if let Ok(command) = registry.get_command(name.as_str()) {
+                if !command.flags().contains(ConsoleFlags::HIDDEN) {
+                    Some(format!(
+                        "{} - {}",
+                        command.name().canonical(),
+                        command.description()
+                    ))
+                } else {
+                    None
+                }
+            } else if let Ok(cvar) = registry.get_cvar(name.as_str()) {
+                if !cvar.flags().contains(ConsoleFlags::HIDDEN) {
+                    Some(format!(
+                        "{} - {}",
+                        cvar.name().canonical(),
+                        cvar.description()
+                    ))
+                } else {
+                    None
+                }
+            } else {
+                None
             }
-            return;
-        }
+        };
 
-        if let Ok(cvar) = self.registry.borrow().get_cvar(name.as_str()) {
-            if !cvar.flags().contains(ConsoleFlags::HIDDEN) {
-                context.write_text(format!(
-                    "{} - {}",
-                    cvar.name().canonical(),
-                    cvar.description()
-                ));
-            }
-            return;
-        }
-
-        context.write_error("help topic not found");
+        let Some(output) = output else {
+            return Err(AegisError::command_not_found("help topic not found"));
+        };
+        context.write_text(output);
+        Ok(())
     }
 
-    fn builtin_get(&self, context: &mut ExecutionContext, args: &[CommandArg]) -> CommandStatus {
+    fn builtin_get(
+        &self,
+        context: &mut ExecutionContext,
+        args: &[CommandArg],
+    ) -> Result<CommandStatus> {
         let Some(name) = args.first() else {
-            context.write_error("get requires a cvar name");
-            return CommandStatus::Failed;
+            return Err(AegisError::invalid_argument("get requires a cvar name"));
         };
-        match self.read_cvar(context, name.as_str()) {
-            ExecutionStatus::Success => CommandStatus::Success,
-            ExecutionStatus::Failed | ExecutionStatus::Blocked => CommandStatus::Failed,
-        }
+        self.read_cvar(context, name.as_str())?;
+        Ok(CommandStatus::Success)
     }
 
-    fn builtin_set(&self, context: &mut ExecutionContext, args: &[CommandArg]) -> CommandStatus {
+    fn builtin_set(
+        &self,
+        context: &mut ExecutionContext,
+        args: &[CommandArg],
+    ) -> Result<CommandStatus> {
         let [name, value] = args else {
-            context.write_error("set requires a cvar name and one value");
-            return CommandStatus::Failed;
+            return Err(AegisError::invalid_argument(
+                "set requires a cvar name and one value",
+            ));
         };
-        match self.write_cvar(context, name.as_str(), value.as_str()) {
-            ExecutionStatus::Success => CommandStatus::Success,
-            ExecutionStatus::Failed | ExecutionStatus::Blocked => CommandStatus::Failed,
-        }
+        self.write_cvar(context, name.as_str(), value.as_str())?;
+        Ok(CommandStatus::Success)
     }
 }
 

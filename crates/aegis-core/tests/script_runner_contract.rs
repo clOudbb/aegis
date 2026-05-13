@@ -1,10 +1,12 @@
 //! Contract tests for script runner public APIs.
 
 use core::time::Duration;
+use std::thread;
 
 use aegis_core::cancel::CancellationToken;
 use aegis_core::error::{AegisError, Result};
-use aegis_core::executor::Executor;
+use aegis_core::executor::{CommandStatus, Executor};
+use aegis_core::flags::ConsoleFlags;
 use aegis_core::script::{ScriptFailurePolicy, ScriptOptions, ScriptRunner};
 
 #[test]
@@ -124,6 +126,34 @@ fn script_runner_observes_pre_cancelled_token() -> Result<()> {
 }
 
 #[test]
+fn script_runner_stops_after_command_requests_cancellation() -> Result<()> {
+    let mut executor = Executor::with_builtins();
+    let token = CancellationToken::new();
+    let command_token = token.clone();
+    executor.register_command(
+        "cancel_now",
+        ConsoleFlags::empty(),
+        "Cancel script",
+        move |_ctx, _args| {
+            command_token.cancel();
+            Ok(CommandStatus::Success)
+        },
+    )?;
+    let runner = ScriptRunner::new(&executor);
+
+    let result = runner.execute_script_with_cancellation(
+        "test.cfg",
+        "cancel_now\necho skipped",
+        ScriptOptions::default(),
+        &token,
+    )?;
+
+    assert_eq!(result.executed_commands(), 1);
+    assert!(result.is_failed());
+    Ok(())
+}
+
+#[test]
 fn script_runner_observes_pre_expired_timeout() -> Result<()> {
     let executor = Executor::with_builtins();
     let runner = ScriptRunner::new(&executor);
@@ -137,6 +167,33 @@ fn script_runner_observes_pre_expired_timeout() -> Result<()> {
     )?;
 
     assert_eq!(result.executed_commands(), 0);
+    assert!(result.is_failed());
+    Ok(())
+}
+
+#[test]
+fn script_runner_stops_after_command_exceeds_timeout() -> Result<()> {
+    let mut executor = Executor::with_builtins();
+    executor.register_command(
+        "slow_command",
+        ConsoleFlags::empty(),
+        "Slow command",
+        |_ctx, _args| {
+            thread::sleep(Duration::from_millis(5));
+            Ok(CommandStatus::Success)
+        },
+    )?;
+    let runner = ScriptRunner::new(&executor);
+    let options = ScriptOptions::default().with_timeout(Duration::from_millis(1));
+
+    let result = runner.execute_script_with_cancellation(
+        "test.cfg",
+        "slow_command\necho skipped",
+        options,
+        &CancellationToken::new(),
+    )?;
+
+    assert_eq!(result.executed_commands(), 1);
     assert!(result.is_failed());
     Ok(())
 }
